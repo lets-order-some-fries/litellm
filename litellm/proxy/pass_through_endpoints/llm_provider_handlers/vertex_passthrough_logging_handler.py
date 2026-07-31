@@ -1,3 +1,4 @@
+import asyncio
 import re
 from datetime import datetime
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union, cast
@@ -37,6 +38,32 @@ else:
 
 # Define EndpointType locally to avoid import issues
 EndpointType = Any
+
+
+def _optional_str(value: object) -> str | None:
+    return value if isinstance(value, str) else None
+
+
+def _optional_str_tuple(value: object) -> tuple[str, ...] | None:
+    if not isinstance(value, list):
+        return None
+    items = cast(list[object], value)  # cast-ok: isinstance-narrowed; element type unknown
+    return tuple(tag for tag in items if isinstance(tag, str))
+
+
+def _request_tags(request_metadata: dict) -> tuple[str, ...] | None:
+    """Tags for the batch-cost spend row: the request's own tags when it sent any,
+    otherwise the key's tags, which auth exposes as user_api_key_auth_metadata (a
+    tagged key does not put its tags in the top-level metadata "tags" on the
+    passthrough path)
+    """
+    tags = _optional_str_tuple(request_metadata.get("tags"))
+    if tags:
+        return tags
+    key_auth_metadata = request_metadata.get("user_api_key_auth_metadata")
+    if isinstance(key_auth_metadata, dict):
+        return _optional_str_tuple(key_auth_metadata.get("tags"))
+    return None
 
 
 class VertexPassthroughLoggingHandler:
@@ -657,13 +684,19 @@ class VertexPassthroughLoggingHandler:
 
                 # Store the managed object for cost tracking
                 # This will be picked up by check_batch_cost polling mechanism
-                VertexPassthroughLoggingHandler._store_batch_managed_object(
-                    unified_object_id=unified_object_id,
-                    batch_object=litellm_batch_response,
-                    model_object_id=batch_id,
-                    logging_obj=logging_obj,
-                    **kwargs,
-                )
+                # Only a POST to the .../batchPredictionJobs collection creates a batch. A
+                # poll of .../batchPredictionJobs/{id} reaches this handler too; registering
+                # from there would race the create's own write and could leave the batch
+                # owned by the polling caller, so the batch is registered from its create.
+                is_batch_create = url_route.split("?")[0].rstrip("/").endswith("batchPredictionJobs")
+                if is_batch_create:
+                    VertexPassthroughLoggingHandler._store_batch_managed_object(
+                        unified_object_id=unified_object_id,
+                        batch_object=litellm_batch_response,
+                        model_object_id=batch_id,
+                        logging_obj=logging_obj,
+                        **kwargs,
+                    )
 
                 # Create a batch job response for logging
                 litellm_model_response = ModelResponse()
@@ -780,6 +813,19 @@ class VertexPassthroughLoggingHandler:
             }
 
     @staticmethod
+    def _log_batch_registration_result(finished: asyncio.Task, unified_object_id: str, model_object_id: str) -> None:
+        error = finished.exception() if not finished.cancelled() else None
+        if finished.cancelled() or error is not None:
+            verbose_proxy_logger.error(
+                f"Failed to store batch managed object with unified_object_id={unified_object_id}, "
+                f"batch_id={model_object_id}; its cost will not be tracked: {error}"
+            )
+            return
+        verbose_proxy_logger.info(
+            f"Stored batch managed object with unified_object_id={unified_object_id}, batch_id={model_object_id}"
+        )
+
+    @staticmethod
     def _store_batch_managed_object(
         unified_object_id: str,
         batch_object: LiteLLMBatch,
@@ -790,6 +836,9 @@ class VertexPassthroughLoggingHandler:
         """
         Store batch managed object for cost tracking.
         This will be picked up by the check_batch_cost polling mechanism.
+
+        Only the batch create calls this, so the creating key and its tags are persisted
+        from the create and never from a later poll.
         """
         try:
             # Get the managed files hook from the logging object
@@ -805,7 +854,7 @@ class VertexPassthroughLoggingHandler:
 
                 user_api_key_dict = UserAPIKeyAuth(
                     user_id=_request_metadata.get("user_api_key_user_id", "default-user"),
-                    api_key="",
+                    api_key=_optional_str(_request_metadata.get("user_api_key")),
                     team_id=_request_metadata.get("user_api_key_team_id"),
                     team_alias=None,
                     user_role=LitellmUserRoles.CUSTOMER,  # Use proper enum value
@@ -827,9 +876,7 @@ class VertexPassthroughLoggingHandler:
                 )
 
                 # Store the unified object for batch cost tracking
-                import asyncio
-
-                asyncio.create_task(
+                task = asyncio.create_task(
                     managed_files_hook.store_unified_object_id(  # type: ignore
                         unified_object_id=unified_object_id,
                         file_object=batch_object,
@@ -837,11 +884,17 @@ class VertexPassthroughLoggingHandler:
                         model_object_id=model_object_id,
                         file_purpose="batch",
                         user_api_key_dict=user_api_key_dict,
+                        request_tags=_request_tags(_request_metadata),
+                        persist_attribution=True,
                     )
                 )
-
-                verbose_proxy_logger.info(
-                    f"Stored batch managed object with unified_object_id={unified_object_id}, batch_id={model_object_id}"
+                # This registration is what makes the batch costable, and it is the only
+                # one: nothing re-registers the batch later, so report a failure here
+                # rather than letting it surface as an unretrieved task exception.
+                task.add_done_callback(
+                    lambda finished: VertexPassthroughLoggingHandler._log_batch_registration_result(
+                        finished, unified_object_id, model_object_id
+                    )
                 )
             else:
                 verbose_proxy_logger.warning(

@@ -4,6 +4,7 @@
 import base64
 import json
 from types import MappingProxyType
+from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Union, cast
 
 from fastapi import HTTPException
@@ -165,7 +166,17 @@ class _PROXY_LiteLLMManagedFiles(CustomLogger, BaseFileEndpoints):
         model_object_id: str,
         file_purpose: Literal["batch", "fine-tune", "response"],
         user_api_key_dict: UserAPIKeyAuth,
+        request_tags: Sequence[str] | None = None,
+        persist_attribution: bool = False,
     ) -> None:
+        """Persist a managed object row, caching it and upserting it in the DB.
+
+        persist_attribution is set only by the batch create, which is the one caller
+        that can speak for the creator; it gates the api_key and request_tags columns
+        that CheckBatchCost bills against, so a later poll or retrieve of the same
+        batch cannot record itself as the paying key. Like created_by and team_id,
+        both are written only in the upsert create branch, never on update.
+        """
         verbose_logger.info(
             f"Storing LiteLLM Managed {file_purpose} object with id={unified_object_id} in cache"
         )
@@ -181,6 +192,17 @@ class _PROXY_LiteLLMManagedFiles(CustomLogger, BaseFileEndpoints):
             litellm_parent_otel_span=litellm_parent_otel_span,
         )
 
+        from prisma import Json
+
+        api_key = user_api_key_dict.api_key or None
+        attribution_columns = (
+            {
+                **({"api_key": api_key} if api_key is not None else {}),
+                **({"request_tags": Json(list(request_tags))} if request_tags else {}),
+            }
+            if persist_attribution
+            else {}
+        )
         await self.prisma_client.db.litellm_managedobjecttable.upsert(
             where={"unified_object_id": unified_object_id},
             data={
@@ -193,6 +215,7 @@ class _PROXY_LiteLLMManagedFiles(CustomLogger, BaseFileEndpoints):
                     "team_id": user_api_key_dict.team_id,
                     "updated_by": user_api_key_dict.user_id,
                     "status": file_object.status,
+                    **attribution_columns,
                 },
                 "update": {
                     "file_object": file_object.model_dump_json(),
