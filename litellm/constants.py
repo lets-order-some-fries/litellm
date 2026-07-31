@@ -1671,3 +1671,4 @@ ADVISOR_TOOL_DESCRIPTION: str = (
 # spend under the table's composite unique constraint.
 PTU_SENTINEL_API_KEY: str = "__ptu_flat_cost__"
 PTU_ROLLUP_JOB_ID: str = "ptu_flat_cost_rollup_job"
+PTU_ROLLUP_LOCK_TTL_SECONDS: int = 900
