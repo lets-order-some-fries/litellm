@@ -1,5 +1,6 @@
 import asyncio
 import re
+from collections.abc import Mapping
 from datetime import datetime
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union, cast
 from urllib.parse import urlparse
@@ -51,7 +52,7 @@ def _optional_str_tuple(value: object) -> tuple[str, ...] | None:
     return tuple(tag for tag in items if isinstance(tag, str))
 
 
-def _request_tags(request_metadata: dict) -> tuple[str, ...] | None:
+def _request_tags(request_metadata: Mapping[str, object]) -> tuple[str, ...] | None:
     """Tags for the batch-cost spend row: the request's own tags when it sent any,
     otherwise the key's tags, which auth exposes as user_api_key_auth_metadata (a
     tagged key does not put its tags in the top-level metadata "tags" on the
@@ -684,10 +685,6 @@ class VertexPassthroughLoggingHandler:
 
                 # Store the managed object for cost tracking
                 # This will be picked up by check_batch_cost polling mechanism
-                # Only a POST to the .../batchPredictionJobs collection creates a batch. A
-                # poll of .../batchPredictionJobs/{id} reaches this handler too; registering
-                # from there would race the create's own write and could leave the batch
-                # owned by the polling caller, so the batch is registered from its create.
                 is_batch_create = url_route.split("?")[0].rstrip("/").endswith("batchPredictionJobs")
                 if is_batch_create:
                     VertexPassthroughLoggingHandler._store_batch_managed_object(
@@ -888,9 +885,6 @@ class VertexPassthroughLoggingHandler:
                         persist_attribution=True,
                     )
                 )
-                # This registration is what makes the batch costable, and it is the only
-                # one: nothing re-registers the batch later, so report a failure here
-                # rather than letting it surface as an unretrieved task exception.
                 task.add_done_callback(
                     lambda finished: VertexPassthroughLoggingHandler._log_batch_registration_result(
                         finished, unified_object_id, model_object_id

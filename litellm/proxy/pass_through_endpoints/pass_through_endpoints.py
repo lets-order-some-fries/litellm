@@ -564,8 +564,6 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
         # real parent span.
         _metadata["user_api_key"] = user_api_key_dict.api_key
         _metadata["litellm_parent_otel_span"] = user_api_key_dict.parent_otel_span
-        # Spend, budget and batch attribution are all keyed off these fields, so restore
-        # every one of them from the authenticated key rather than the merged body.
         _metadata.update(
             LiteLLMProxyRequestSetup.get_sanitized_user_information_from_key(user_api_key_dict=user_api_key_dict)
         )

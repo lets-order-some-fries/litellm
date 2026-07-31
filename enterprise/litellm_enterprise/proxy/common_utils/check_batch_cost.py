@@ -98,7 +98,9 @@ class CheckBatchCost:
         Rebuild the spend-tracking metadata for the key, team, and tags that created the
         batch so the batch-cost spend log is attributed the same way a non-batch request
         is. Rows created before api_key and request_tags were persisted carry only
-        created_by and team_id, and fall back to those.
+        created_by and team_id, and fall back to those. When the creating key is known,
+        its own alias owns user_api_key_alias, which _get_user_info otherwise fills with
+        the creating user's alias.
         """
         api_key = getattr(job, "api_key", None)
         team_id = getattr(job, "team_id", None)
@@ -111,8 +113,6 @@ class CheckBatchCost:
             **(await self._get_user_info(batch_id, job.created_by)),
         }
 
-        # _get_user_info reports the USER's alias under user_api_key_alias. Once the
-        # creating key is known its own alias owns that field, even when the key has none.
         if api_key is not None:
             metadata["user_api_key_alias"] = await self._get_key_alias(batch_id, api_key)
         team_alias = await self._get_team_alias(team_id)
