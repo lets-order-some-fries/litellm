@@ -3910,6 +3910,51 @@ class TestPriceDataReloadIntegration:
             litellm.model_cost = original_model_cost
             _invalidate_model_cost_lowercase_map()
 
+    def test_scheduled_reload_replays_registrations_and_logs_cleanly(self):
+        """The scheduled reload is the trigger a pod hits on its own, so it must
+        both preserve runtime-registered model metadata and run to completion.
+        The reload itself happens early in the handler, so a failure in the
+        bookkeeping after it is swallowed by the surrounding except and would
+        otherwise leave the metadata correct while the path is quietly broken."""
+        from litellm import utils as litellm_utils
+        from litellm.proxy.proxy_server import ProxyConfig
+        from litellm.proxy.utils import litellm_config_cache
+        from litellm.utils import _invalidate_model_cost_lowercase_map
+
+        proxy_config = ProxyConfig()
+        litellm_config_cache.flush_cache()
+
+        mock_config = MagicMock()
+        mock_config.param_value = {"interval_hours": 6, "force_reload": True}
+        mock_prisma = MagicMock()
+        mock_prisma.db.litellm_config.find_unique = AsyncMock(return_value=mock_config)
+        mock_prisma.get_generic_data = AsyncMock(return_value=mock_config)
+        mock_prisma.db.litellm_config.upsert = AsyncMock(return_value=None)
+
+        original_model_cost = litellm.model_cost
+        original_registry = dict(litellm_utils._runtime_registered_model_cost)
+        try:
+            litellm.register_model(
+                model_cost={"custom/deployment-model": {"litellm_provider": "custom", "max_input_tokens": 4321}}
+            )
+
+            with patch(
+                "litellm.litellm_core_utils.get_model_cost_map.get_model_cost_map",
+                return_value={"gpt-4o": {"litellm_provider": "openai", "mode": "chat"}},
+            ):
+                with patch("litellm.proxy.proxy_server.verbose_proxy_logger") as mock_logger:
+                    asyncio.run(proxy_config._check_and_reload_model_cost_map(mock_prisma))
+
+            mock_logger.exception.assert_not_called()
+            assert litellm.model_cost["custom/deployment-model"]["max_input_tokens"] == 4321
+            assert "gpt-4o" in litellm.model_cost
+        finally:
+            litellm.model_cost = original_model_cost
+            litellm_utils._runtime_registered_model_cost.clear()
+            litellm_utils._runtime_registered_model_cost.update(original_registry)
+            _invalidate_model_cost_lowercase_map()
+            litellm_config_cache.flush_cache()
+
     def test_distributed_reload_check_function(self):
         """Test the _check_and_reload_model_cost_map function"""
         from litellm.proxy.proxy_server import ProxyConfig

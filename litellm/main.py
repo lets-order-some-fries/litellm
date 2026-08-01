@@ -1127,13 +1127,14 @@ def _register_custom_pricing_for_request(
     shared_key = f"{custom_llm_provider}/{model}"
     deployment_id = _get_router_deployment_id(kwargs)
     if deployment_id is None:
-        litellm.register_model({shared_key: entry})
+        litellm.register_model({shared_key: entry}, persist_across_reloads=False)
         return
     litellm.register_model(
         {
             deployment_id: entry,
             shared_key: CustomPricingLiteLLMParams.strip_custom_pricing_fields(entry),
-        }
+        },
+        persist_across_reloads=False,
     )
 
 
