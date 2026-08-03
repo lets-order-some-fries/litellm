@@ -40,7 +40,7 @@ from litellm.types.integrations.websearch_interception import (
     WebSearchInterceptionConfig,
 )
 from litellm.types.llms.openai import AllMessageValues
-from litellm.types.utils import CallTypes, LlmProviders
+from litellm.types.utils import CallTypes, LlmProviders, StandardLoggingUserAPIKeyMetadata
 from litellm.utils import ProviderConfigManager
 
 if TYPE_CHECKING:
@@ -1277,10 +1277,14 @@ class WebSearchInterceptionLogger(CustomLogger):
             search_tool = self._select_search_tool_from_router(llm_router=llm_router)
             search_provider: str | None = None
             search_litellm_params: dict[str, Any] = {}
+            search_tool_name: str | None = None
             if search_tool is not None:
                 await self._authorize_search_tool(search_tool=search_tool, kwargs=kwargs)
                 search_litellm_params = dict(search_tool.get("litellm_params", {}) or {})
                 search_provider = search_litellm_params.get("search_provider")
+                selected_tool_name = search_tool.get("search_tool_name")
+                if isinstance(selected_tool_name, str) and selected_tool_name:
+                    search_tool_name = selected_tool_name
 
             # Fallback to perplexity if no router or no search tools configured
             if not search_provider:
@@ -1298,6 +1302,18 @@ class WebSearchInterceptionLogger(CustomLogger):
                 for key, value in search_litellm_params.items()
                 if key != "search_provider" and value is not None
             }
+            user_api_key_auth = self._get_user_api_key_auth_from_kwargs(kwargs)
+            if user_api_key_auth is not None:
+                search_metadata = self._build_search_request_metadata(
+                    user_api_key_auth=user_api_key_auth,
+                    search_tool_name=search_tool_name,
+                )
+                await self._enforce_search_rate_limits(
+                    user_api_key_auth=user_api_key_auth,
+                    search_tool_name=search_tool_name or search_provider,
+                    search_metadata=search_metadata,
+                )
+                search_kwargs["litellm_metadata"] = search_metadata
             result = await litellm.asearch(query=query, search_provider=search_provider, **search_kwargs)
 
             # Format using transformation function
@@ -1354,6 +1370,54 @@ class WebSearchInterceptionLogger(CustomLogger):
                 search_tool_name=search_tool_name,
                 team_object=team_object,
             )
+
+    @staticmethod
+    def _build_search_request_metadata(
+        user_api_key_auth: "UserAPIKeyAuth",
+        search_tool_name: str | None,
+    ) -> dict[str, object]:
+        """
+        Spend-tracking metadata for the intercepted search, so its provider cost is logged
+        and billed against the key/user/team that made the originating LLM request instead
+        of being dropped by the proxy's spend hook for lack of an owner.
+        """
+        from litellm.proxy.litellm_pre_call_utils import LiteLLMProxyRequestSetup
+
+        user_api_key_metadata: StandardLoggingUserAPIKeyMetadata = (
+            LiteLLMProxyRequestSetup.get_sanitized_user_information_from_key(user_api_key_dict=user_api_key_auth)
+        )
+        return {
+            **user_api_key_metadata,
+            **({} if search_tool_name is None else {"model_group": search_tool_name}),
+            "user_api_key": user_api_key_auth.api_key,
+            "user_api_key_auth": user_api_key_auth,
+        }
+
+    @staticmethod
+    async def _enforce_search_rate_limits(
+        user_api_key_auth: "UserAPIKeyAuth",
+        search_tool_name: str | None,
+        search_metadata: dict[str, object],
+    ) -> None:
+        """
+        Run the key/user/team rate limit checks the search would have gone through on
+        ``/v1/search``, so an intercepted search cannot bypass the caller's RPM/TPM limits.
+        """
+        try:
+            from litellm.proxy.proxy_server import proxy_logging_obj, user_api_key_cache
+        except ImportError:
+            return
+
+        rate_limiter = proxy_logging_obj.get_proxy_hook("parallel_request_limiter")
+        if rate_limiter is None:
+            return
+
+        await rate_limiter.async_pre_call_hook(  # pyright: ignore[reportUnknownMemberType]  # hook is typed with a bare dict return
+            user_api_key_dict=user_api_key_auth,
+            cache=user_api_key_cache,
+            data={"model": search_tool_name, "litellm_metadata": search_metadata},
+            call_type="asearch",
+        )
 
     @staticmethod
     def _get_user_api_key_auth_from_kwargs(kwargs: Mapping[str, object] | None) -> "UserAPIKeyAuth | None":
