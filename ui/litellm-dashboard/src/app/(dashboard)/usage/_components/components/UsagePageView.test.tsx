@@ -25,6 +25,7 @@ beforeAll(() => {
 vi.mock("@/components/networking", () => ({
   userDailyActivityCall: vi.fn(),
   userDailyActivityAggregatedCall: vi.fn(),
+  gatewayDailyActivityCall: vi.fn(),
   tagListCall: vi.fn(),
 }));
 
@@ -333,6 +334,7 @@ describe("UsagePage", () => {
   const mockUserDailyActivityAggregatedCall = vi.mocked(networking.userDailyActivityAggregatedCall);
   const mockUserDailyActivityCall = vi.mocked(networking.userDailyActivityCall);
   const mockTagListCall = vi.mocked(networking.tagListCall);
+  const mockGatewayDailyActivityCall = vi.mocked(networking.gatewayDailyActivityCall);
   const mockUseCustomers = vi.mocked(useCustomers);
   const mockUseAgents = vi.mocked(useAgents);
   const mockUseAuthorized = vi.mocked(useAuthorized);
@@ -476,6 +478,15 @@ describe("UsagePage", () => {
     },
   ];
 
+  // Counts deliberately unlike anything in mockSpendData: the gateway tile must be
+  // readable as coming from /gateway/daily/activity and from nothing else.
+  const mockGatewayActivity = {
+    total_successful_requests: 424242,
+    total_failed_requests: 909,
+    by_date: [{ date: "2025-01-01", successful_requests: 424242, failed_requests: 909 }],
+    by_route: [{ category: "llm", route: "/chat/completions", successful_requests: 424242, failed_requests: 909 }],
+  };
+
   const defaultProps = {
     teams: [
       {
@@ -522,7 +533,9 @@ describe("UsagePage", () => {
     mockUserDailyActivityAggregatedCall.mockClear();
     mockUserDailyActivityCall.mockClear();
     mockTagListCall.mockClear();
+    mockGatewayDailyActivityCall.mockClear();
     mockUserDailyActivityAggregatedCall.mockResolvedValue(mockSpendData);
+    mockGatewayDailyActivityCall.mockResolvedValue(mockGatewayActivity);
     mockUseInfiniteUsers.mockReturnValue({
       data: {
         pages: [
@@ -571,9 +584,55 @@ describe("UsagePage", () => {
     expect(screen.getByText("1,500")).toBeInTheDocument();
     const successfulRequestLabelElements = screen.getAllByText("Successful Requests");
     expect(successfulRequestLabelElements.length).toBeGreaterThan(0);
-    // Use getAllByText since this value appears in multiple places (metrics card + table)
-    const successfulRequestElements = screen.getAllByText("1,450");
-    expect(successfulRequestElements.length).toBeGreaterThan(0);
+    // Successful and Failed Requests both read the gateway counter, not the
+    // spend-derived 1,450 / 50 that the same payload carries for the per-key and
+    // per-model breakdowns. They must share a source, or the tiles contradict the
+    // endpoint breakdown chart below them.
+    await waitFor(() => {
+      expect(screen.getAllByText("424,242").length).toBeGreaterThan(0);
+    });
+    expect(screen.getAllByText("909").length).toBeGreaterThan(0);
+    expect(screen.queryByText("1,450")).not.toBeInTheDocument();
+  });
+
+  it("should fall back to the spend-derived count when the gateway endpoint is unavailable", async () => {
+    mockGatewayDailyActivityCall.mockRejectedValue(new Error("gateway activity unavailable"));
+
+    renderWithProviders(<UsagePage {...defaultProps} />);
+
+    await waitFor(() => {
+      expect(mockGatewayDailyActivityCall).toHaveBeenCalled();
+    });
+    await waitFor(() => {
+      expect(screen.getAllByText("1,450").length).toBeGreaterThan(0);
+    });
+    expect(screen.queryByText("424,242")).not.toBeInTheDocument();
+    expect(screen.queryByText("909")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("gateway-requests-by-endpoint")).not.toBeInTheDocument();
+  });
+
+  it("should not request deployment-wide gateway counts for a non-admin", async () => {
+    mockUseAuthorized.mockReturnValue({
+      isLoading: false,
+      isAuthorized: true,
+      token: "mock-token",
+      accessToken: "test-token",
+      userId: "user-123",
+      userEmail: "test@example.com",
+      userRole: "Internal User",
+      premiumUser: true,
+      disabledPersonalKeyCreation: false,
+      showSSOBanner: false,
+    });
+
+    renderWithProviders(<UsagePage {...defaultProps} />);
+
+    await waitFor(() => {
+      expect(mockUserDailyActivityAggregatedCall).toHaveBeenCalled();
+    });
+    expect(mockGatewayDailyActivityCall).not.toHaveBeenCalled();
+    expect(screen.queryByText("424,242")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("gateway-requests-by-endpoint")).not.toBeInTheDocument();
   });
 
   it("should display usage metrics and charts", async () => {
@@ -605,13 +664,20 @@ describe("UsagePage", () => {
       expect(mockUserDailyActivityAggregatedCall).toHaveBeenCalled();
     });
 
+    // The gateway endpoint breakdown is a separate chart with its own palette,
+    // so it is excluded rather than allowed to widen the expected fill set.
+    const spendBars = () => {
+      const gatewayCard = container.querySelector('[data-testid="gateway-requests-by-endpoint"]');
+      return Array.from(container.querySelectorAll("path.recharts-rectangle")).filter(
+        (rect) => !gatewayCard?.contains(rect),
+      );
+    };
+
     await waitFor(() => {
-      expect(container.querySelectorAll("path.recharts-rectangle")).toHaveLength(2);
+      expect(spendBars()).toHaveLength(2);
     });
 
-    const fills = new Set(
-      Array.from(container.querySelectorAll("path.recharts-rectangle")).map((rect) => rect.getAttribute("fill")),
-    );
+    const fills = new Set(spendBars().map((rect) => rect.getAttribute("fill")));
     expect(fills).toEqual(new Set(["var(--color-cyan-500, #06b6d4)"]));
 
     expect(screen.getAllByText("2025-01-01").length).toBeGreaterThan(0);
