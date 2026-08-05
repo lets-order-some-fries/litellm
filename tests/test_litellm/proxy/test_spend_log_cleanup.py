@@ -158,8 +158,8 @@ async def test_cleanup_old_spend_logs_batch_deletion():
     mock_db = MagicMock()
 
     # Mock execute_raw to return deleted counts (3 spend-log batches, then the
-    # tool-index cleanup's first batch returning 0)
-    mock_db.execute_raw = AsyncMock(side_effect=[1000, 500, 0, 0])
+    # tool-index and auto-router session cleanups' first batches returning 0)
+    mock_db.execute_raw = AsyncMock(side_effect=[1000, 500, 0, 0, 0])
 
     # Wire up mocks
     mock_prisma_client.db = mock_db
@@ -179,7 +179,7 @@ async def test_cleanup_old_spend_logs_batch_deletion():
     await cleaner.cleanup_old_spend_logs(mock_prisma_client)
 
     # Validate batching and deletion via raw SQL
-    assert mock_db.execute_raw.call_count == 4
+    assert mock_db.execute_raw.call_count == 5
 
     # Check the first call argument
     call_args_sql = mock_db.execute_raw.call_args_list[0][0][0]
@@ -285,7 +285,7 @@ async def test_cleanup_uses_delete_when_partitioning_not_enabled():
     from unittest.mock import AsyncMock, MagicMock
 
     mock_prisma_client = MagicMock()
-    mock_prisma_client.db.execute_raw = AsyncMock(side_effect=[10, 0, 0])
+    mock_prisma_client.db.execute_raw = AsyncMock(side_effect=[10, 0, 0, 0])
 
     partition_manager = MagicMock()
     partition_manager.is_partitioned = AsyncMock(return_value=True)
@@ -316,7 +316,7 @@ async def test_cleanup_uses_delete_when_not_partitioned():
     from unittest.mock import AsyncMock, MagicMock
 
     mock_prisma_client = MagicMock()
-    mock_prisma_client.db.execute_raw = AsyncMock(side_effect=[10, 0, 0])
+    mock_prisma_client.db.execute_raw = AsyncMock(side_effect=[10, 0, 0, 0])
 
     partition_manager = MagicMock()
     partition_manager.is_partitioned = AsyncMock(return_value=False)
@@ -335,7 +335,7 @@ async def test_cleanup_uses_delete_when_not_partitioned():
     await cleaner.cleanup_old_spend_logs(mock_prisma_client)
 
     partition_manager.drop_partitions_older_than.assert_not_awaited()
-    assert mock_prisma_client.db.execute_raw.await_count == 3
+    assert mock_prisma_client.db.execute_raw.await_count == 4
     delete_sql = mock_prisma_client.db.execute_raw.call_args_list[0][0][0]
     assert 'DELETE FROM "LiteLLM_SpendLogs"' in delete_sql
 
