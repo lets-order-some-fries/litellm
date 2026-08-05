@@ -43,8 +43,8 @@ def _extract_custom_pricing(litellm_params: LiteLLMParamsTypedDict) -> CostPerTo
     Pull per-token pricing configured on a deployment so on-prem / self-hosted
     models (absent from the public cost map) still estimate a real cost.
     """
-    input_cost = litellm_params["input_cost_per_token"] if "input_cost_per_token" in litellm_params else None
-    output_cost = litellm_params["output_cost_per_token"] if "output_cost_per_token" in litellm_params else None
+    input_cost = litellm_params.get("input_cost_per_token")
+    output_cost = litellm_params.get("output_cost_per_token")
 
     if input_cost is None and output_cost is None:
         return None
