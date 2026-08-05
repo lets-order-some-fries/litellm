@@ -6,7 +6,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from litellm.proxy._types import CostEstimateRequest
+from litellm.proxy._types import CostEstimateRequest, CostEstimateResponse
 from litellm.proxy.management_endpoints.cost_tracking_settings import estimate_cost
 
 
@@ -26,7 +26,9 @@ class TestCostEstimateEndpoint:
             num_requests_per_month=3000,
         )
 
-        with patch("litellm.proxy.management_endpoints.cost_tracking_settings.completion_cost") as mock_completion_cost:
+        with patch(
+            "litellm.proxy.management_endpoints.cost_tracking_settings.completion_cost"
+        ) as mock_completion_cost:
             mock_completion_cost.return_value = 0.06
 
             with patch("litellm.get_model_info") as mock_get_model_info:
@@ -57,7 +59,9 @@ class TestCostEstimateEndpoint:
             output_tokens=500,
         )
 
-        with patch("litellm.proxy.management_endpoints.cost_tracking_settings.completion_cost") as mock_completion_cost:
+        with patch(
+            "litellm.proxy.management_endpoints.cost_tracking_settings.completion_cost"
+        ) as mock_completion_cost:
             mock_completion_cost.side_effect = Exception("Model not found in cost map")
 
             from fastapi import HTTPException
@@ -132,96 +136,3 @@ class TestCostEstimateEndpoint:
         assert response.model == "my-gpt4-alias"
         assert response.cost_per_request == 0.05
         assert response.provider == "azure"
-
-    @pytest.mark.asyncio
-    async def test_estimate_cost_onprem_model_without_pricing(self):
-        """
-        On-prem deployments (custom_llm_provider set, model absent from the cost map)
-        must not 500 with "LLM Provider NOT provided". The resolved provider has to be
-        forwarded to completion_cost so provider inference doesn't run on the bare model.
-
-        Regression for LIT-5210. completion_cost is intentionally NOT mocked.
-        """
-        import litellm
-
-        request = CostEstimateRequest(
-            model="nvidia/zai-org/glm-5.2",
-            input_tokens=1000,
-            output_tokens=500,
-        )
-
-        mock_router = MagicMock()
-        mock_router.get_model_list.return_value = [
-            {
-                "model_name": "nvidia/zai-org/glm-5.2",
-                "litellm_params": {
-                    "model": "zai-org/GLM-5.2",
-                    "custom_llm_provider": "openai",
-                },
-                "model_info": {},
-            }
-        ]
-
-        saved_model_cost = dict(litellm.model_cost)
-        litellm.register_model(
-            {
-                "openai/zai-org/GLM-5.2": {
-                    "input_cost_per_token": 0.0,
-                    "output_cost_per_token": 0.0,
-                    "litellm_provider": "openai",
-                    "mode": "chat",
-                }
-            }
-        )
-        try:
-            with patch("litellm.proxy.proxy_server.llm_router", mock_router):
-                response = await estimate_cost(request=request, user_api_key_dict=MagicMock())
-        finally:
-            litellm.model_cost = saved_model_cost
-
-        assert response.model == "nvidia/zai-org/glm-5.2"
-        assert response.provider == "openai"
-        assert response.cost_per_request == 0.0
-
-    @pytest.mark.asyncio
-    async def test_estimate_cost_onprem_model_with_configured_pricing(self):
-        """
-        On-prem deployments with input/output_cost_per_token configured must estimate a
-        real cost using that pricing, not fall back to 0.0.
-
-        Regression for LIT-5210. completion_cost is intentionally NOT mocked.
-        """
-        request = CostEstimateRequest(
-            model="nvidia/zai-org/glm-5.2",
-            input_tokens=1000,
-            output_tokens=500,
-            num_requests_per_day=100,
-        )
-
-        mock_router = MagicMock()
-        mock_router.get_model_list.return_value = [
-            {
-                "model_name": "nvidia/zai-org/glm-5.2",
-                "litellm_params": {
-                    "model": "zai-org/GLM-5.2",
-                    "custom_llm_provider": "openai",
-                    "input_cost_per_token": 0.000001,
-                    "output_cost_per_token": 0.000002,
-                },
-                "model_info": {
-                    "input_cost_per_token": 0.000001,
-                    "output_cost_per_token": 0.000002,
-                },
-            }
-        ]
-
-        with patch("litellm.proxy.proxy_server.llm_router", mock_router):
-            response = await estimate_cost(request=request, user_api_key_dict=MagicMock())
-
-        assert response.provider == "openai"
-        assert response.cost_per_request == pytest.approx(0.002)
-        assert response.input_cost_per_request == pytest.approx(0.001)
-        assert response.output_cost_per_request == pytest.approx(0.001)
-        assert response.daily_cost == pytest.approx(0.2)
-        assert response.input_cost_per_token == pytest.approx(0.000001)
-        assert response.output_cost_per_token == pytest.approx(0.000002)

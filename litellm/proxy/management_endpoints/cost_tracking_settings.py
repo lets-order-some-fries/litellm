@@ -10,6 +10,7 @@ PATCH /config/cost_margin_config - Update cost margin configuration
 POST /cost/estimate - Estimate cost for a given model and token counts
 """
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Final
 
@@ -25,7 +26,6 @@ from litellm.proxy._types import (
     UserAPIKeyAuth,
 )
 from litellm.proxy.auth.user_api_key_auth import user_api_key_auth
-from litellm.types.router import LiteLLMParamsTypedDict
 from litellm.types.utils import CostPerToken, LlmProvidersSet
 
 router: Final = APIRouter()
@@ -38,7 +38,7 @@ class ResolvedCostModel:
     custom_cost_per_token: CostPerToken | None
 
 
-def _extract_custom_pricing(litellm_params: LiteLLMParamsTypedDict) -> CostPerToken | None:
+def _extract_custom_pricing(litellm_params: Mapping[str, object]) -> CostPerToken | None:
     """
     Pull per-token pricing configured on a deployment so on-prem / self-hosted
     models (absent from the public cost map) still estimate a real cost.
@@ -46,12 +46,15 @@ def _extract_custom_pricing(litellm_params: LiteLLMParamsTypedDict) -> CostPerTo
     input_cost = litellm_params.get("input_cost_per_token")
     output_cost = litellm_params.get("output_cost_per_token")
 
-    if input_cost is None and output_cost is None:
+    input_price = float(input_cost) if isinstance(input_cost, (int, float)) else None
+    output_price = float(output_cost) if isinstance(output_cost, (int, float)) else None
+
+    if input_price is None and output_price is None:
         return None
 
     return CostPerToken(
-        input_cost_per_token=input_cost or 0.0,
-        output_cost_per_token=output_cost or 0.0,
+        input_cost_per_token=input_price or 0.0,
+        output_cost_per_token=output_price or 0.0,
     )
 
 
@@ -79,7 +82,7 @@ def _resolve_model_for_cost_lookup(model: str) -> ResolvedCostModel:
                 model_info: Final = first_deployment.get("model_info", {})
                 custom_llm_provider: Final = litellm_params.get("custom_llm_provider")
                 provider: Final = str(custom_llm_provider) if custom_llm_provider is not None else None
-                custom_cost_per_token: Final = _extract_custom_pricing(first_deployment["litellm_params"])
+                custom_cost_per_token: Final = _extract_custom_pricing(litellm_params)
 
                 # Check base_model first (needed for Azure custom deployment names)
                 base_model: Final = model_info.get("base_model") or litellm_params.get("base_model")
