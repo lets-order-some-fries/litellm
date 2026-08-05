@@ -10,6 +10,7 @@ PATCH /config/cost_margin_config - Update cost margin configuration
 POST /cost/estimate - Estimate cost for a given model and token counts
 """
 
+from dataclasses import dataclass
 from typing import Final
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -24,28 +25,47 @@ from litellm.proxy._types import (
     UserAPIKeyAuth,
 )
 from litellm.proxy.auth.user_api_key_auth import user_api_key_auth
-from litellm.types.utils import LlmProvidersSet
+from litellm.types.router import LiteLLMParamsTypedDict
+from litellm.types.utils import CostPerToken, LlmProvidersSet
 
 router: Final = APIRouter()
 
 
-def _resolve_model_for_cost_lookup(model: str) -> tuple[str, str | None]:
+@dataclass(frozen=True, slots=True)
+class ResolvedCostModel:
+    model: str
+    provider: str | None
+    custom_cost_per_token: CostPerToken | None
+
+
+def _extract_custom_pricing(litellm_params: LiteLLMParamsTypedDict) -> CostPerToken | None:
+    """
+    Pull per-token pricing configured on a deployment so on-prem / self-hosted
+    models (absent from the public cost map) still estimate a real cost.
+    """
+    input_cost = litellm_params["input_cost_per_token"] if "input_cost_per_token" in litellm_params else None
+    output_cost = litellm_params["output_cost_per_token"] if "output_cost_per_token" in litellm_params else None
+
+    if input_cost is None and output_cost is None:
+        return None
+
+    return CostPerToken(
+        input_cost_per_token=input_cost or 0.0,
+        output_cost_per_token=output_cost or 0.0,
+    )
+
+
+def _resolve_model_for_cost_lookup(model: str) -> ResolvedCostModel:
     """
     Resolve a model name (which may be a router alias/model_group) to the
-    underlying litellm model name for cost lookup.
+    underlying litellm model name, provider, and any deployment-configured
+    pricing used for cost lookup.
 
     Args:
         model: The model name from the request (could be a router alias like 'e-model-router'
                or an actual model name like 'azure_ai/gpt-4')
-
-    Returns:
-        Tuple of (resolved_model_name, custom_llm_provider)
-        - resolved_model_name: The actual model name to use for cost lookup
-        - custom_llm_provider: The provider if resolved from router, None otherwise
     """
     from litellm.proxy.proxy_server import llm_router
-
-    custom_llm_provider: str | None = None
 
     # Try to resolve from router if available
     if llm_router is not None:
@@ -57,31 +77,25 @@ def _resolve_model_for_cost_lookup(model: str) -> tuple[str, str | None]:
                 first_deployment: Final = deployments[0]
                 litellm_params: Final = first_deployment.get("litellm_params", {})
                 model_info: Final = first_deployment.get("model_info", {})
+                custom_llm_provider: Final = litellm_params.get("custom_llm_provider")
+                provider: Final = str(custom_llm_provider) if custom_llm_provider is not None else None
+                custom_cost_per_token: Final = _extract_custom_pricing(first_deployment["litellm_params"])
 
                 # Check base_model first (needed for Azure custom deployment names)
                 base_model: Final = model_info.get("base_model") or litellm_params.get("base_model")
                 if base_model:
                     verbose_proxy_logger.debug("Resolved model '%s' to base_model '%s' from router", model, base_model)
-                    custom_llm_provider = litellm_params.get("custom_llm_provider")
-                    return (
-                        str(base_model),
-                        (str(custom_llm_provider) if custom_llm_provider is not None else None),
-                    )
+                    return ResolvedCostModel(str(base_model), provider, custom_cost_per_token)
 
                 resolved_model: Final = litellm_params.get("model")
-
                 if resolved_model:
                     verbose_proxy_logger.debug("Resolved model '%s' to '%s' from router", model, resolved_model)
-                    custom_llm_provider = litellm_params.get("custom_llm_provider")
-                    return (
-                        str(resolved_model),
-                        (str(custom_llm_provider) if custom_llm_provider is not None else None),
-                    )
+                    return ResolvedCostModel(str(resolved_model), provider, custom_cost_per_token)
         except Exception as e:
             verbose_proxy_logger.debug("Could not resolve model '%s' from router: %s", model, e)
 
     # Return original model if not resolved
-    return model, custom_llm_provider
+    return ResolvedCostModel(model, None, None)
 
 
 def _calculate_period_costs(num_requests, cost_per_request, input_cost, output_cost, margin_cost):
@@ -450,7 +464,9 @@ async def estimate_cost(
     from litellm.types.utils import ModelResponse, Usage
 
     # Resolve model name (handles router aliases like 'e-model-router' -> 'azure_ai/gpt-4')
-    resolved_model, resolved_provider = _resolve_model_for_cost_lookup(request.model)
+    resolved: Final = _resolve_model_for_cost_lookup(request.model)
+    resolved_model: Final = resolved.model
+    resolved_provider: Final = resolved.provider
 
     verbose_proxy_logger.debug("Cost estimate: request.model='%s' resolved to '%s'", request.model, resolved_model)
 
@@ -480,6 +496,8 @@ async def estimate_cost(
         cost_per_request: Final = completion_cost(
             completion_response=mock_response,
             model=resolved_model,
+            custom_llm_provider=resolved_provider,
+            custom_cost_per_token=resolved.custom_cost_per_token,
             litellm_logging_obj=litellm_logging_obj,
         )
     except Exception as e:
@@ -507,6 +525,10 @@ async def estimate_cost(
         input_cost_per_token = None
         output_cost_per_token = None
         custom_llm_provider = None
+
+    if resolved.custom_cost_per_token is not None:
+        input_cost_per_token = resolved.custom_cost_per_token["input_cost_per_token"]
+        output_cost_per_token = resolved.custom_cost_per_token["output_cost_per_token"]
 
     # Use provider from router resolution if not found in model_info
     if custom_llm_provider is None and resolved_provider is not None:
