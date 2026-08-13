@@ -2903,3 +2903,44 @@ def test_tier_request_without_tier_pricing_keeps_the_standard_reasoning_rate():
     )
 
     assert completion_cost == pytest.approx(400 * 4e-06 + 600 * 6e-06, rel=1e-9)
+
+
+@pytest.mark.parametrize("service_tier", ["flex", "priority"])
+def test_token_type_cost_breakdown_reconciles_under_service_tier(service_tier):
+    """
+    Same reconciliation guarantee as the tier-less test above, under a
+    service tier. Regression: the breakdown priced reasoning tokens at the
+    standard reasoning rate while the billed total priced them at the
+    tier-resolved rate, so cost_breakdown.reasoning_cost drifted from (and
+    under flex, exceeded) the completion total it is a component of.
+    """
+    os.environ["LITELLM_LOCAL_MODEL_COST_MAP"] = "True"
+    litellm.model_cost = litellm.get_model_cost_map(url="")
+
+    model = "gemini-3.5-flash-lite"
+    custom_llm_provider = "gemini"
+    usage = Usage(
+        prompt_tokens=100,
+        completion_tokens=1000,
+        total_tokens=1100,
+        completion_tokens_details=CompletionTokensDetailsWrapper(
+            reasoning_tokens=1000, text_tokens=0
+        ),
+    )
+
+    _prompt_cost, completion_total = generic_cost_per_token(
+        model=model,
+        usage=usage,
+        custom_llm_provider=custom_llm_provider,
+        service_tier=service_tier,
+    )
+    breakdown = get_token_type_cost_breakdown(
+        model=model,
+        custom_llm_provider=custom_llm_provider,
+        usage=usage,
+        service_tier=service_tier,
+    )
+
+    # Every completion token is a reasoning token, so the reasoning subset
+    # must equal the billed completion total exactly.
+    assert breakdown.reasoning_cost == pytest.approx(completion_total)
